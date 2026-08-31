@@ -17,6 +17,7 @@ package io.delta.spark.internal.v2.read;
 
 import io.delta.kernel.Snapshot;
 import io.delta.kernel.expressions.Predicate;
+import io.delta.spark.internal.v2.DeltaV2JavaLogging;
 import io.delta.spark.internal.v2.utils.PartitionUtils;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -39,18 +40,21 @@ import org.apache.spark.sql.types.StructType;
  * <p>This class must remain package-private so callers outside {@code v2.read} depend only on
  * Spark's public connector interfaces instead of coupling to Delta's internal V2 implementation.
  */
-class DeltaV2Batch implements Batch {
+class DeltaV2Batch extends DeltaV2JavaLogging implements Batch {
   private final Snapshot snapshot;
   private final StructType readDataSchema;
   private final StructType dataSchema;
   private final StructType partitionSchema;
   private final StructType ddlOrderedReadOutputSchema;
   private final Predicate[] pushedToKernelFilters;
+  // Only data-column filters may be handed to the Parquet reader. Partition columns are not stored
+  // in Parquet files; their values are materialized from PartitionedFile.partitionValues.
   private final Filter[] dataFilters;
-  // Derived Sets used only for equals/hashCode: filters are AND-ed at eval time,
-  // so list order has no semantic meaning.
+  // Derived Sets used only for equals/hashCode. pushedFiltersSet contains both partition and data
+  // filters so batches selecting different file sets remain distinct; filter order is immaterial
+  // because the filters are AND-ed at evaluation time.
   private final Set<Predicate> pushedToKernelFiltersSet;
-  private final Set<Filter> dataFiltersSet;
+  private final Set<Filter> pushedFiltersSet;
   private final Configuration hadoopConf;
   private final SQLConf sqlConf;
   private final long totalBytes;
@@ -66,6 +70,7 @@ class DeltaV2Batch implements Batch {
       List<PartitionedFile> partitionedFiles,
       Predicate[] pushedToKernelFilters,
       Filter[] dataFilters,
+      Filter[] pushedFilters,
       long totalBytes,
       scala.collection.immutable.Map<String, String> scalaOptions,
       Configuration hadoopConf) {
@@ -83,7 +88,8 @@ class DeltaV2Batch implements Batch {
         pushedToKernelFilters == null ? new Predicate[0] : pushedToKernelFilters.clone();
     this.dataFilters = dataFilters == null ? new Filter[0] : dataFilters.clone();
     this.pushedToKernelFiltersSet = Set.copyOf(Arrays.asList(this.pushedToKernelFilters));
-    this.dataFiltersSet = Set.copyOf(Arrays.asList(this.dataFilters));
+    this.pushedFiltersSet =
+        Set.copyOf(Arrays.asList(pushedFilters == null ? new Filter[0] : pushedFilters));
     this.totalBytes = totalBytes;
     this.scalaOptions = Objects.requireNonNull(scalaOptions, "scalaOptions is null");
     this.hadoopConf = Objects.requireNonNull(hadoopConf, "hadoopConf is null");
@@ -92,24 +98,30 @@ class DeltaV2Batch implements Batch {
 
   @Override
   public InputPartition[] planInputPartitions() {
-    return PartitionUtils.planInputPartitions(
-        SparkSession.active(), partitionedFiles, totalBytes, hadoopConf, sqlConf);
+    return recordFrameProfileValue(
+        "batchScan.planInputPartitions",
+        () ->
+            PartitionUtils.planInputPartitions(
+                SparkSession.active(), partitionedFiles, totalBytes, hadoopConf, sqlConf));
   }
 
   @Override
   public PartitionReaderFactory createReaderFactory() {
     // Non-CDC plain table scan. Write-time CDF streaming reads route through
-    // SparkMicroBatchStream; read-time CDF batch reads route through DeltaChangelogBatch.
-    return PartitionUtils.createDeltaParquetReaderFactory(
-        snapshot,
-        dataSchema,
-        partitionSchema,
-        readDataSchema,
-        ddlOrderedReadOutputSchema,
-        dataFilters,
-        scalaOptions,
-        hadoopConf,
-        sqlConf);
+    // DeltaV2MicroBatchStream; read-time CDF batch reads use a dedicated batch implementation.
+    return recordFrameProfileValue(
+        "batchScan.createReaderFactory",
+        () ->
+            PartitionUtils.createDeltaParquetReaderFactory(
+                snapshot,
+                dataSchema,
+                partitionSchema,
+                readDataSchema,
+                ddlOrderedReadOutputSchema,
+                dataFilters,
+                scalaOptions,
+                hadoopConf,
+                sqlConf));
   }
 
   @Override
@@ -123,7 +135,7 @@ class DeltaV2Batch implements Batch {
         && Objects.equals(this.dataSchema, that.dataSchema)
         && Objects.equals(this.partitionSchema, that.partitionSchema)
         && Objects.equals(this.pushedToKernelFiltersSet, that.pushedToKernelFiltersSet)
-        && Objects.equals(this.dataFiltersSet, that.dataFiltersSet)
+        && Objects.equals(this.pushedFiltersSet, that.pushedFiltersSet)
         && partitionedFiles.size() == that.partitionedFiles.size();
   }
 
@@ -135,7 +147,7 @@ class DeltaV2Batch implements Batch {
         dataSchema,
         partitionSchema,
         pushedToKernelFiltersSet,
-        dataFiltersSet,
+        pushedFiltersSet,
         partitionedFiles.size());
   }
 }

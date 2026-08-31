@@ -33,6 +33,8 @@ import org.apache.spark.sql.delta.metering.DeltaLogging
 import org.apache.spark.sql.delta.sources.DeltaSQLConf
 import org.apache.spark.sql.delta.stats.{FileSizeHistogram, FileSizeHistogramUtils}
 import org.apache.spark.sql.util.ScalaExtensions._
+import org.apache.hadoop.conf.Configuration
+import org.apache.hadoop.fs.Path
 
 import org.apache.spark.internal.MDC
 import org.apache.spark.sql.SparkSession
@@ -43,6 +45,22 @@ import org.apache.spark.sql.catalyst.catalog.CatalogTable
  */
 trait TransactionHelper extends DeltaLogging {
   def deltaLog: DeltaLog
+
+  /** The path to the Delta table data directory. */
+  def dataPath: Path
+
+  /** The path to the Delta log directory. */
+  def logPath: Path
+
+  /** The Hadoop [[Configuration]] used to access the Delta log. */
+  def newDeltaHadoopConf(): Configuration = deltaLog.newDeltaHadoopConf()
+
+  /** Canonical name of the commit log store class for commit-stats telemetry. */
+  protected def commitLogStoreClassName: String = deltaLog.store.getClass.getCanonicalName
+
+  /** Value used for the `TAG_LOG_STORE_CLASS` operation tag. */
+  protected[delta] def commitLogStoreClassNameForTag: String = deltaLog.store.getClass.getName
+
   def catalogTable: Option[CatalogTable]
   def snapshot: Snapshot
 
@@ -184,7 +202,7 @@ trait TransactionHelper extends DeltaLogging {
         case _ =>
           throw new IllegalStateException(
             "Unexpected state found when trying " +
-            s"to generate CoordinatedCommitsStats for table ${deltaLog.logPath}. " +
+            s"to generate CoordinatedCommitsStats for table ${logPath}. " +
             s"$readSnapshotTableCommitCoordinatorClientOpt, " +
             s"$metadata, $snapshot, $catalogTable")
       }
@@ -366,7 +384,8 @@ trait TransactionHelper extends DeltaLogging {
         fileSizeHistogramOpt: Option[FileSizeHistogram],
         commitInfoOpt: Option[CommitInfo],
         commitSizeBytes: Long,
-        amtWriteMetricsOpt: Option[AMTWriteMetrics] = None): Unit = {
+        amtWriteMetricsOpt: Option[AMTWriteMetrics] = None,
+        isIdempotentRetry: Boolean = false): Unit = {
       assertStateBeforeFinalization()
 
       val doCollectCommitStats =
